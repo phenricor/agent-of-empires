@@ -24,7 +24,9 @@ struct Highlighter {
 fn highlighter() -> &'static Highlighter {
     static H: OnceLock<Highlighter> = OnceLock::new();
     H.get_or_init(|| {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        // two-face bundles bat's extended syntax set (TypeScript, Razor, etc.),
+        // covering far more than syntect's small default set.
+        let syntaxes = two_face::syntax::extra_newlines();
         let mut themes = ThemeSet::load_defaults();
         // A dark theme that reads well on the app's dark UI. Fall back to any
         // available theme if the expected key is ever missing.
@@ -35,6 +37,15 @@ fn highlighter() -> &'static Highlighter {
             .expect("syntect ships at least one default theme");
         Highlighter { syntaxes, theme }
     })
+}
+
+/// Map an extension with no dedicated syntax to a close relative's extension.
+fn alias_extension(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "cshtml" | "razor" | "vbhtml" => Some("html"),
+        "csproj" | "vbproj" | "props" | "targets" | "config" | "nuspec" | "resx" => Some("xml"),
+        _ => None,
+    }
 }
 
 /// Map a syntect color to a ratatui truecolor. Alpha is ignored.
@@ -58,14 +69,19 @@ fn to_style(s: SynStyle) -> Style {
 /// syntax matches the file, letting the caller fall back to a flat style.
 pub fn highlight_line(path: &Path, content: &str) -> Option<Vec<Span<'static>>> {
     let h = highlighter();
-    let syntax = path
-        .extension()
-        .and_then(|e| e.to_str())
+    let ext = path.extension().and_then(|e| e.to_str());
+    let syntax = ext
         .and_then(|ext| h.syntaxes.find_syntax_by_extension(ext))
         .or_else(|| {
             path.file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|name| h.syntaxes.find_syntax_by_extension(name))
+        })
+        .or_else(|| {
+            // Extensions with no dedicated syntax that are really another
+            // language (Razor is HTML-ish, project files are XML).
+            ext.and_then(alias_extension)
+                .and_then(|a| h.syntaxes.find_syntax_by_extension(a))
         })?;
 
     let mut hl = HighlightLines::new(syntax, &h.theme);
@@ -102,5 +118,24 @@ mod tests {
     #[test]
     fn unknown_extension_returns_none() {
         assert!(highlight_line(Path::new("data.zzz_unknown"), "plain text").is_none());
+    }
+
+    #[test]
+    fn covers_extended_and_aliased_languages() {
+        // two-face adds TypeScript; the alias table routes Razor/csproj.
+        for (file, code) in [
+            ("app.ts", "const x: number = 1;"),
+            ("Foo.cs", "public class Foo {}"),
+            ("View.cshtml", "<div>@Model.Name</div>"),
+            (
+                "App.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>",
+            ),
+        ] {
+            assert!(
+                highlight_line(Path::new(file), code).is_some(),
+                "{file} should syntax-highlight"
+            );
+        }
     }
 }

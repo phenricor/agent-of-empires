@@ -111,9 +111,14 @@ rattles = "0.3"
 regex = "1.10"
 
 # Syntax highlighting for the TUI diff view. `default-fancy` uses the pure-Rust
-# fancy-regex engine, avoiding the onig C dependency.
+# fancy-regex engine, avoiding the onig C dependency. `two-face` supplies bat's
+# extended syntax set (TypeScript, Razor, and many more that syntect's bundled
+# defaults lack).
 syntect = { version = "5.2", default-features = false, features = [
     "default-fancy",
+] }
+two-face = { version = "0.4", default-features = false, features = [
+    "syntect-fancy",
 ] }
 
 # Git operations

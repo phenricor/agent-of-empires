@@ -764,6 +764,63 @@ mod tests {
         );
     }
 
+    /// True if any cell in the rendered buffer carries a truecolor (Rgb) fg,
+    /// which only syntect highlighting produces (theme colors are named).
+    fn rendered_has_rgb_fg(view: &mut DiffView, width: u16, height: u16) -> bool {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = load_theme("empire");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        buf.content()
+            .iter()
+            .any(|c| matches!(c.fg, ratatui::style::Color::Rgb(_, _, _)))
+    }
+
+    #[test]
+    fn unified_diff_syntax_highlights_known_language() {
+        use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileDiff};
+        use std::path::PathBuf;
+
+        let path = PathBuf::from("Foo.cs");
+        let file = DiffFile {
+            path: path.clone(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+        };
+        let diff = FileDiff {
+            file: file.clone(),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![DiffLine {
+                    tag: ChangeTag::Insert,
+                    old_line_num: None,
+                    new_line_num: Some(1),
+                    content: "public class Foo { }\n".to_string(),
+                }],
+            }],
+            is_binary: false,
+        };
+        let mut view = DiffView::test_default();
+        view.files = vec![file];
+        view.selected_file = 0;
+        view.diff_cache.insert(view.diff_key(0), diff);
+        assert!(
+            rendered_has_rgb_fg(&mut view, 120, 24),
+            "expected syntect truecolor spans in the rendered .cs diff"
+        );
+    }
+
     fn render_diff_to_string(view: &mut DiffView, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
