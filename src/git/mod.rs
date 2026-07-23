@@ -19,6 +19,7 @@ pub mod cleanup;
 pub(crate) mod command;
 pub mod diff;
 pub mod error;
+pub mod log;
 mod remote;
 pub mod scan;
 pub mod template;

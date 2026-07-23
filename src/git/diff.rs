@@ -213,7 +213,7 @@ pub fn compute_changed_files(repo_path: &Path, base_branch: &str) -> Result<Vec<
 }
 
 /// Resolve a reference to a commit (branch name, tag, or commit hash)
-fn get_commit_from_ref<'a>(
+pub(crate) fn get_commit_from_ref<'a>(
     repo: &'a git2::Repository,
     reference: &str,
 ) -> Result<git2::Commit<'a>> {

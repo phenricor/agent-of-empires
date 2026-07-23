@@ -914,6 +914,9 @@ pub struct HomeView {
     // Diff view
     pub(super) diff_view: Option<DiffView>,
 
+    // Commits view: this session's commits since its base, across every repo
+    pub(super) commits_view: Option<crate::tui::commits::CommitsView>,
+
     // Resizable list column width (percentage-like units)
     pub(super) list_width: u16,
 
@@ -2255,6 +2258,7 @@ impl HomeView {
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
+            commits_view: None,
             list_width: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)

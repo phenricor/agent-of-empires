@@ -3,6 +3,7 @@
 mod app;
 mod attached_status_hooks;
 pub(crate) mod clipboard;
+pub mod commits;
 mod components;
 mod creation_poller;
 mod deletion_poller;

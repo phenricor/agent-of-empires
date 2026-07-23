@@ -47,6 +47,8 @@ pub enum ActionId {
     Rename,
     SetWorktreeName,
     Diff,
+    /// Session commits since the base branch, across every workspace repo.
+    Commits,
     Serve,
     Settings,
     Profiles,
@@ -657,6 +659,22 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::Commits,
+        non_strict: &[k('L')],
+        strict: &[ctrl('l')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Views,
+            desc: "Commits view (session log)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Open commits view",
+            keywords: &["git", "log", "commits", "history"],
+            group: PaletteGroup::Views,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Serve,
         non_strict: &[k('R')],
         strict: &[ctrl('r')],
@@ -933,6 +951,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Rename => "rename",
         ActionId::SetWorktreeName => "set-worktree-name",
         ActionId::Diff => "diff",
+        ActionId::Commits => "commits",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",
         ActionId::Profiles => "profiles",

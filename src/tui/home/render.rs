@@ -726,6 +726,12 @@ impl HomeView {
             return;
         }
 
+        // Commits view takes over the whole screen
+        if let Some(ref mut commits) = self.commits_view {
+            commits.render(frame, area, theme);
+            return;
+        }
+
         // Serve view takes over the whole screen
         #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {

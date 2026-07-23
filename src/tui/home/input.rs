@@ -1780,6 +1780,17 @@ impl HomeView {
             }
         }
 
+        // Handle commits view (full-screen takeover)
+        if let Some(ref mut commits_view) = self.commits_view {
+            match commits_view.handle_key(key) {
+                crate::tui::commits::CommitsAction::Continue => return None,
+                crate::tui::commits::CommitsAction::Close => {
+                    self.commits_view = None;
+                    return None;
+                }
+            }
+        }
+
         // Handle serve view (full-screen takeover)
         #[cfg(feature = "serve")]
         if let Some(ref mut serve) = self.serve_view {
@@ -2765,6 +2776,7 @@ impl HomeView {
             ActionId::Rename => self.open_rename_for_selected(),
             ActionId::SetWorktreeName => self.open_worktree_name_for_selected(),
             ActionId::Diff => self.open_diff_for_selected(),
+            ActionId::Commits => self.open_commits_for_selected(),
             ActionId::Serve => self.open_serve(),
             ActionId::Settings => self.open_settings(),
             ActionId::Profiles => self.show_profile_picker(),
@@ -3473,6 +3485,67 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    fn open_commits_for_selected(&mut self) {
+        let Some(session_id) = &self.selected_session else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Session Selected",
+                "Select a session to view its commits.",
+            ));
+            return;
+        };
+        let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new("Error", "Could not find session data."));
+            return;
+        };
+
+        let repo_path = std::path::PathBuf::from(&inst.project_path);
+
+        // Same repo resolution as the diff view: a workspace aggregates over
+        // its members, whose root is intentionally not a git repo.
+        let repos: Vec<crate::tui::diff::DiffRepo> = inst
+            .workspace_info
+            .as_ref()
+            .map(|w| {
+                w.repos
+                    .iter()
+                    .map(|r| crate::tui::diff::DiffRepo {
+                        name: r.name.clone(),
+                        root: std::path::PathBuf::from(&r.worktree_path),
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![crate::tui::diff::DiffRepo {
+                    name: repo_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "repo".to_string()),
+                    root: repo_path.clone(),
+                }]
+            });
+
+        if inst.workspace_info.is_none() && !crate::git::GitWorktree::is_git_repo(&repo_path) {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Git Repository",
+                "This session runs in place in a non-git directory, so there are no commits to show.",
+            ));
+            return;
+        }
+
+        let base_branch = inst
+            .base_branch_override
+            .clone()
+            .or_else(|| {
+                inst.worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone())
+            })
+            .or_else(|| crate::git::diff::get_default_base_ref(&repos[0].root).ok())
+            .unwrap_or_else(|| "main".to_string());
+
+        self.commits_view = Some(crate::tui::commits::CommitsView::new(&repos, base_branch));
     }
 
     fn open_serve(&mut self) {
