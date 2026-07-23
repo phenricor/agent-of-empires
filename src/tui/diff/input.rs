@@ -120,8 +120,10 @@ impl DiffView {
 
             // Open external editor
             (KeyCode::Char('e'), _) | (KeyCode::Enter, _) => {
-                if let Some(file) = self.selected_file() {
-                    let full_path = self.repo_path.join(&file.path);
+                if self.selected_file().is_some() {
+                    // Route to the file's own repo, which differs from the
+                    // primary in a multi-repo workspace.
+                    let full_path = self.diff_key(self.selected_file);
                     return DiffAction::EditFile(full_path);
                 }
                 DiffAction::Continue

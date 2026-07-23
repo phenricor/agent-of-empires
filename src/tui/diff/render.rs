@@ -186,17 +186,25 @@ impl DiffView {
 
                 let prefix = if is_selected { "> " } else { "  " };
 
+                // In a multi-repo workspace, prefix each row with its repo so
+                // rows from different repos are distinguishable.
+                let repo_prefix = self
+                    .file_repo_name(i)
+                    .map(|n| format!("{n}/"))
+                    .unwrap_or_default();
+
                 let display_path = if is_selected {
                     // Selected: show full path, truncate from left with ellipsis
-                    let full = file.path.to_string_lossy();
+                    let full = format!("{}{}", repo_prefix, file.path.to_string_lossy());
                     truncate_left(&full, max_path_width)
                 } else {
-                    // Not selected: show filename only
-                    file.path
+                    // Not selected: show repo prefix + filename
+                    let name = file
+                        .path
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string()
+                        .unwrap_or("?");
+                    format!("{repo_prefix}{name}")
                 };
 
                 let line = Line::from(vec![
@@ -294,8 +302,9 @@ impl DiffView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let cache_key = self.diff_key(self.selected_file);
         if let Some(file) = self.files.get(self.selected_file) {
-            if let Some(diff) = self.diff_cache.get(&file.path) {
+            if let Some(diff) = self.diff_cache.get(&cache_key) {
                 if diff.is_binary {
                     let msg =
                         Paragraph::new("Binary file").style(Style::default().fg(theme.dimmed));
@@ -798,7 +807,7 @@ mod tests {
 
         let selected = view.files[14].clone();
         view.diff_cache.insert(
-            selected.path.clone(),
+            view.diff_key(14),
             FileDiff {
                 file: selected,
                 hunks: vec![DiffHunk {
@@ -869,7 +878,8 @@ mod tests {
         let mut view = DiffView::test_default();
         view.files = vec![file];
         view.selected_file = 0;
-        view.diff_cache.insert(path, diff);
+        let _ = path;
+        view.diff_cache.insert(view.diff_key(0), diff);
         view.split_view = true;
 
         let out = render_diff_to_string(&mut view, 120, 24);
@@ -933,7 +943,8 @@ mod tests {
         let mut view = DiffView::test_default();
         view.files = vec![file];
         view.selected_file = 0;
-        view.diff_cache.insert(path, diff);
+        let _ = path;
+        view.diff_cache.insert(view.diff_key(0), diff);
         view.split_view = true;
 
         let out = render_diff_to_string(&mut view, 200, 20);

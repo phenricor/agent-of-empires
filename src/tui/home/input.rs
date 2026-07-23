@@ -3427,10 +3427,27 @@ impl HomeView {
             .as_ref()
             .and_then(|w| w.base_branch.clone());
 
-        // A session on a non-git project runs in place, so there is no repo to
-        // diff against. Show a clear message instead of letting the git layer
-        // surface a raw "could not open repository" error.
-        if !crate::git::GitWorktree::is_git_repo(&repo_path) {
+        // Multi-repo workspace: aggregate over each member repo. The workspace
+        // root itself is not a git repo, so the single-repo guard below would
+        // wrongly reject it.
+        let workspace_repos: Vec<crate::tui::diff::DiffRepo> = inst
+            .workspace_info
+            .as_ref()
+            .map(|w| {
+                w.repos
+                    .iter()
+                    .map(|r| crate::tui::diff::DiffRepo {
+                        name: r.name.clone(),
+                        root: std::path::PathBuf::from(&r.worktree_path),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A single-repo session on a non-git project runs in place, so there is
+        // no repo to diff. Show a clear message instead of a raw git error.
+        // Workspace sessions skip this: their root is intentionally non-git.
+        if workspace_repos.is_empty() && !crate::git::GitWorktree::is_git_repo(&repo_path) {
             self.info_dialog = Some(InfoDialog::new(
                 "No Git Repository",
                 "This session runs in place in a non-git directory, so there is no diff to show.",
@@ -3440,6 +3457,7 @@ impl HomeView {
 
         match DiffView::new_for_session(
             repo_path,
+            workspace_repos,
             Some(session_id_owned),
             profile,
             base_override,

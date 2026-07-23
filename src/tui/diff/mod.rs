@@ -27,10 +27,31 @@ pub struct BranchSelectState {
     pub selected: usize,
 }
 
+/// One repository the diff view aggregates over. Single-repo sessions have one;
+/// multi-repo workspace sessions have one per member repo, so the file list and
+/// per-file diffs span every repo (like claude-squad's group diff).
+#[derive(Debug, Clone)]
+pub struct DiffRepo {
+    /// Display name (repo directory basename), shown as a prefix when there is
+    /// more than one repo.
+    pub name: String,
+    /// Worktree root this repo's files and diffs are computed against.
+    pub root: PathBuf,
+}
+
 /// The diff view state
 pub struct DiffView {
-    /// Path to the repository root
+    /// Path to the primary repository root. For a workspace this is the first
+    /// member repo; branch listing and merge-base status use it.
     pub(crate) repo_path: PathBuf,
+
+    /// Every repo the view aggregates over (one for a single-repo session,
+    /// one per member for a workspace). `files[i]` belongs to
+    /// `repos[file_repo_idx[i]]`.
+    pub(crate) repos: Vec<DiffRepo>,
+
+    /// Repo index for each entry in `files`, kept in lockstep with it.
+    pub(crate) file_repo_idx: Vec<usize>,
 
     /// Session id this diff view belongs to. None when opened in a
     /// session-agnostic context (legacy `DiffView::new`); persistence
@@ -116,7 +137,15 @@ impl DiffView {
     /// that have a session id should use `new_for_session` so the
     /// override persists.
     pub fn new(repo_path: PathBuf, file_watch: Arc<FileWatchService>) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None, None, file_watch)
+        Self::new_for_session(
+            repo_path,
+            Vec::new(),
+            None,
+            String::new(),
+            None,
+            None,
+            file_watch,
+        )
     }
 
     /// Create a diff view bound to a session. `base_override` (the
@@ -127,12 +156,28 @@ impl DiffView {
     /// record.
     pub fn new_for_session(
         repo_path: PathBuf,
+        workspace_repos: Vec<DiffRepo>,
         session_id: Option<String>,
         profile: String,
         base_override: Option<String>,
         worktree_base: Option<String>,
         file_watch: Arc<FileWatchService>,
     ) -> anyhow::Result<Self> {
+        // A workspace session aggregates over its member repos; a plain session
+        // is a single repo at `repo_path`. Either way `repos[0]` is the primary
+        // used for branch listing / merge-base, and `repo_path` follows it.
+        let repos = if workspace_repos.is_empty() {
+            vec![DiffRepo {
+                name: repo_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "repo".to_string()),
+                root: repo_path.clone(),
+            }]
+        } else {
+            workspace_repos
+        };
+        let repo_path = repos[0].root.clone();
         // Use the profile-merged config so a per-profile Diff override (e.g.
         // split_view) is honored on open. The session-agnostic path (empty
         // profile) falls back to the global config.
@@ -166,6 +211,8 @@ impl DiffView {
 
         let mut view = Self {
             repo_path,
+            repos,
+            file_repo_idx: Vec::new(),
             session_id,
             profile,
             base_branch,
@@ -193,9 +240,53 @@ impl DiffView {
         Ok(view)
     }
 
-    /// Refresh the list of changed files
+    /// Repo root the file at `idx` belongs to.
+    fn file_root(&self, idx: usize) -> &std::path::Path {
+        let repo = self.file_repo_idx.get(idx).copied().unwrap_or(0);
+        &self.repos[repo.min(self.repos.len().saturating_sub(1))].root
+    }
+
+    /// Cache/lookup key for a file's diff. Uses the file's worktree-absolute
+    /// path so two member repos sharing a relative path (e.g. `README.md`) do
+    /// not collide.
+    pub(crate) fn diff_key(&self, idx: usize) -> PathBuf {
+        match self.files.get(idx) {
+            Some(f) => self.file_root(idx).join(&f.path),
+            None => PathBuf::new(),
+        }
+    }
+
+    /// Repo display name for the file at `idx`, or None when the view spans a
+    /// single repo (nothing to disambiguate).
+    pub(crate) fn file_repo_name(&self, idx: usize) -> Option<&str> {
+        if self.repos.len() < 2 {
+            return None;
+        }
+        let repo = self.file_repo_idx.get(idx).copied().unwrap_or(0);
+        self.repos.get(repo).map(|r| r.name.as_str())
+    }
+
+    /// Refresh the list of changed files, aggregating across every repo. A repo
+    /// that errors (e.g. the base ref is missing there) is skipped rather than
+    /// failing the whole view.
     pub fn refresh_files(&mut self) -> anyhow::Result<()> {
-        self.files = compute_changed_files(&self.repo_path, &self.base_branch)?;
+        let mut files = Vec::new();
+        let mut file_repo_idx = Vec::new();
+        for (i, repo) in self.repos.iter().enumerate() {
+            match compute_changed_files(&repo.root, &self.base_branch) {
+                Ok(fs) => {
+                    for f in fs {
+                        files.push(f);
+                        file_repo_idx.push(i);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(target: "tui.diff", "skip repo {} in diff: {e}", repo.name);
+                }
+            }
+        }
+        self.files = files;
+        self.file_repo_idx = file_repo_idx;
         self.diff_cache.clear();
         if self.selected_file >= self.files.len() {
             self.selected_file = self.files.len().saturating_sub(1);
@@ -233,18 +324,16 @@ impl DiffView {
 
     /// Get or compute the diff for the selected file
     pub fn get_current_diff(&mut self) -> Option<&FileDiff> {
-        let file = self.files.get(self.selected_file)?;
-        let path = file.path.clone();
+        let idx = self.selected_file;
+        let file = self.files.get(idx)?;
+        let rel_path = file.path.clone();
+        let root = self.file_root(idx).to_path_buf();
+        let key = self.diff_key(idx);
 
-        if !self.diff_cache.contains_key(&path) {
-            match compute_file_diff(
-                &self.repo_path,
-                &path,
-                &self.base_branch,
-                self.context_lines,
-            ) {
+        if !self.diff_cache.contains_key(&key) {
+            match compute_file_diff(&root, &rel_path, &self.base_branch, self.context_lines) {
                 Ok(diff) => {
-                    self.diff_cache.insert(path.clone(), diff);
+                    self.diff_cache.insert(key.clone(), diff);
                 }
                 Err(e) => {
                     self.error_message = Some(format!("Failed to compute diff: {}", e));
@@ -253,7 +342,7 @@ impl DiffView {
             }
         }
 
-        self.diff_cache.get(&path)
+        self.diff_cache.get(&key)
     }
 
     /// Open the branch selection dialog
@@ -445,6 +534,11 @@ impl DiffView {
     pub(crate) fn test_default() -> Self {
         Self {
             repo_path: std::path::PathBuf::from("/tmp/fake"),
+            repos: vec![DiffRepo {
+                name: "fake".to_string(),
+                root: std::path::PathBuf::from("/tmp/fake"),
+            }],
+            file_repo_idx: Vec::new(),
             session_id: None,
             profile: String::new(),
             base_branch: "main".to_string(),
@@ -467,5 +561,83 @@ impl DiffView {
             file_list_scroll_offset: 0,
             file_watch: FileWatchService::noop(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(["-C", dir.to_str().unwrap()])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A repo on branch `main` with one committed file and an uncommitted edit
+    /// to it, so `compute_changed_files` reports exactly that file.
+    fn repo_with_change(file: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "user.email", "t@t"]);
+        git(p, &["config", "user.name", "t"]);
+        std::fs::write(p.join(file), "base\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join(file), "changed\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn refresh_files_aggregates_across_repos() {
+        let a = repo_with_change("a.txt");
+        let b = repo_with_change("b.txt");
+
+        let mut view = DiffView::test_default();
+        view.repos = vec![
+            DiffRepo {
+                name: "A".to_string(),
+                root: a.path().to_path_buf(),
+            },
+            DiffRepo {
+                name: "B".to_string(),
+                root: b.path().to_path_buf(),
+            },
+        ];
+        view.base_branch = "main".to_string();
+        view.refresh_files().unwrap();
+
+        assert_eq!(view.files.len(), 2, "one changed file per repo");
+        assert_eq!(view.file_repo_idx.len(), view.files.len());
+        // Multi-repo: each file carries a repo name for the list prefix.
+        assert!(view.file_repo_name(0).is_some());
+        // Diff keys route to the file's own repo, so they are distinct and
+        // rooted under the right worktree.
+        let k0 = view.diff_key(0);
+        let k1 = view.diff_key(1);
+        assert_ne!(k0, k1);
+        assert!(k0.starts_with(a.path()) || k0.starts_with(b.path()));
+    }
+
+    #[test]
+    fn single_repo_has_no_repo_prefix() {
+        let a = repo_with_change("only.txt");
+        let mut view = DiffView::test_default();
+        view.repos = vec![DiffRepo {
+            name: "solo".to_string(),
+            root: a.path().to_path_buf(),
+        }];
+        view.base_branch = "main".to_string();
+        view.refresh_files().unwrap();
+
+        assert_eq!(view.files.len(), 1);
+        // A single-repo view has nothing to disambiguate, so no prefix.
+        assert!(view.file_repo_name(0).is_none());
     }
 }
