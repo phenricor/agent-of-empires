@@ -82,12 +82,21 @@ impl DiffView {
             // Close view
             (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => DiffAction::Close,
 
-            // File navigation (j/k always navigate between files)
+            // Vim motions: j/k scroll the diff line-wise, [/] step between
+            // files (matching claude-squad's diff pane).
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                self.prev_file();
+                self.scroll_up(1);
                 DiffAction::Continue
             }
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                self.scroll_down(1);
+                DiffAction::Continue
+            }
+            (KeyCode::Char('['), _) => {
+                self.prev_file();
+                DiffAction::Continue
+            }
+            (KeyCode::Char(']'), _) => {
                 self.next_file();
                 DiffAction::Continue
             }

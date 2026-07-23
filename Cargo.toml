@@ -281,6 +281,13 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Build dependencies optimized even in dev builds. Syntax highlighting
+# (syntect + its regex engine) runs per rendered diff line, and unoptimized
+# dependency code makes the diff view visibly laggy while the crate itself
+# stays debug (keeping the isolated `-dev` namespace and fast recompiles).
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.dev-release]
 inherits = "release"
 lto = false

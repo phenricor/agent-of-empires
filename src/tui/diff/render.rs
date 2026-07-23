@@ -2,7 +2,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
@@ -224,6 +224,42 @@ impl DiffView {
         frame.render_widget(list, inner);
     }
 
+    /// Blend `accent` toward `base` so an added/deleted row can carry a subtle
+    /// tint behind syntax colors (delta-style). Only defined for truecolor
+    /// pairs; named/indexed theme colors have no channels to mix, so those
+    /// themes simply render without a row tint.
+    fn blend(accent: Color, base: Color, alpha: f32) -> Option<Color> {
+        match (accent, base) {
+            (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+                let mix = |a: u8, b: u8| ((a as f32 * alpha) + (b as f32 * (1.0 - alpha))) as u8;
+                Some(Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Row background for a diff line: a faint wash of the add/delete color, or
+    /// None for context lines (and themes without truecolor).
+    fn row_tint(tag: ChangeTag, theme: &Theme) -> Option<Color> {
+        // Low alpha keeps the wash readable under syntax-highlighted text.
+        const ALPHA: f32 = 0.18;
+        match tag {
+            ChangeTag::Insert => Self::blend(theme.diff_add, theme.background, ALPHA),
+            ChangeTag::Delete => Self::blend(theme.diff_delete, theme.background, ALPHA),
+            ChangeTag::Equal => None,
+        }
+    }
+
+    /// Apply a row background to every span, so the tint spans the full row
+    /// rather than just the glyphs.
+    fn tint_spans(spans: &mut [Span<'static>], tint: Option<Color>) {
+        if let Some(bg) = tint {
+            for s in spans.iter_mut() {
+                s.style = s.style.bg(bg);
+            }
+        }
+    }
+
     /// Build one side of a split row: right-justified line number, a +/-/space
     /// marker, and content truncated to `content_w` columns. `None` renders an
     /// empty cell of the same width.
@@ -293,6 +329,9 @@ impl DiffView {
                 if pad > 0 {
                     spans.push(Span::raw(" ".repeat(pad)));
                 }
+                // The cell is padded to a fixed width, so tinting every span
+                // washes the whole row like delta does.
+                Self::tint_spans(&mut spans, Self::row_tint(l.tag, theme));
                 spans
             }
         }
@@ -408,6 +447,14 @@ impl DiffView {
                                 Some(hl) if !hl.is_empty() => spans.extend(hl),
                                 _ => spans.push(Span::styled(content.to_string(), style)),
                             }
+                            // Pad to the pane width so the row tint washes the
+                            // whole line, not just the glyphs.
+                            let used = (2 * num_width + 2) + 1 + UnicodeWidthStr::width(content);
+                            let pad = (inner.width as usize).saturating_sub(used);
+                            if pad > 0 {
+                                spans.push(Span::raw(" ".repeat(pad)));
+                            }
+                            Self::tint_spans(&mut spans, Self::row_tint(line.tag, theme));
                             lines.push(Line::from(spans));
                         }
                     }
@@ -476,11 +523,11 @@ impl DiffView {
         } else {
             Line::from(vec![
                 Span::styled("j/k", Style::default().fg(theme.accent)),
+                Span::styled(": scroll  ", Style::default().fg(theme.dimmed)),
+                Span::styled("[/]", Style::default().fg(theme.accent)),
                 Span::styled(": files  ", Style::default().fg(theme.dimmed)),
                 Span::styled("h/l", Style::default().fg(theme.accent)),
                 Span::styled(": resize  ", Style::default().fg(theme.dimmed)),
-                Span::styled("scroll", Style::default().fg(theme.accent)),
-                Span::styled(": diff  ", Style::default().fg(theme.dimmed)),
                 Span::styled("e/Enter", Style::default().fg(theme.accent)),
                 Span::styled(": edit  ", Style::default().fg(theme.dimmed)),
                 Span::styled("b", Style::default().fg(theme.accent)),
@@ -631,7 +678,7 @@ impl DiffView {
 
     fn render_help(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width = 55u16;
-        let dialog_height = 21u16;
+        let dialog_height = 22u16;
 
         let x = area.x + (area.width.saturating_sub(dialog_width)) / 2;
         let y = area.y + (area.height.saturating_sub(dialog_height)) / 2;
@@ -664,7 +711,8 @@ impl DiffView {
             (
                 "Navigation",
                 vec![
-                    ("j/k, ↑/↓", "Navigate between files"),
+                    ("j/k, ↑/↓", "Scroll diff line by line"),
+                    ("[ / ]", "Previous / next file"),
                     ("PgUp/Dn", "Page up / down in diff"),
                     ("Ctrl+u/d", "Half-page up / down"),
                     ("g/G", "Go to top / bottom of diff"),
@@ -836,6 +884,75 @@ mod tests {
         assert!(
             rendered_has_rgb_fg(&mut view, 120, 24),
             "expected syntect truecolor spans in the rendered .cs diff"
+        );
+    }
+
+    /// Count cells carrying a truecolor background, which only the add/delete
+    /// row tint produces.
+    fn rendered_rgb_bg_cells(view: &mut DiffView, width: u16, height: u16) -> usize {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = load_theme("empire");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        buf.content()
+            .iter()
+            .filter(|c| matches!(c.bg, ratatui::style::Color::Rgb(_, _, _)))
+            .count()
+    }
+
+    #[test]
+    fn changed_rows_get_a_background_tint() {
+        use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileDiff};
+        use std::path::PathBuf;
+
+        let file = DiffFile {
+            path: PathBuf::from("Foo.cs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+        };
+        let diff = FileDiff {
+            file: file.clone(),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    DiffLine {
+                        tag: ChangeTag::Delete,
+                        old_line_num: Some(1),
+                        new_line_num: None,
+                        content: "var old = 1;\n".to_string(),
+                    },
+                    DiffLine {
+                        tag: ChangeTag::Insert,
+                        old_line_num: None,
+                        new_line_num: Some(1),
+                        content: "var new = 2;\n".to_string(),
+                    },
+                ],
+            }],
+            is_binary: false,
+        };
+        let mut view = DiffView::test_default();
+        view.files = vec![file];
+        view.selected_file = 0;
+        view.diff_cache.insert(view.diff_key(0), diff);
+
+        // The tint washes the full row, so it covers many cells, not just the
+        // few glyphs of the changed text.
+        let tinted = rendered_rgb_bg_cells(&mut view, 120, 24);
+        assert!(
+            tinted > 40,
+            "expected the add/delete rows to be tinted across their width, got {tinted} cells"
         );
     }
 
