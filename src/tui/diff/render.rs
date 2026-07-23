@@ -227,13 +227,14 @@ impl DiffView {
     /// Build one side of a split row: right-justified line number, a +/-/space
     /// marker, and content truncated to `content_w` columns. `None` renders an
     /// empty cell of the same width.
-    fn split_cell<'a>(
-        line: Option<&'a crate::git::diff::DiffLine>,
+    fn split_cell(
+        line: Option<&crate::git::diff::DiffLine>,
         is_left: bool,
         num_width: usize,
         content_w: usize,
+        path: &std::path::Path,
         theme: &Theme,
-    ) -> Vec<Span<'a>> {
+    ) -> Vec<Span<'static>> {
         // Every cell occupies exactly this width (line number + space + marker
         // + padded content) so both columns line up and the divider draws as a
         // straight vertical line regardless of content length.
@@ -257,7 +258,7 @@ impl DiffView {
                 // Measure and pad by terminal column width, not scalar count,
                 // so wide (CJK/emoji) characters keep the two columns aligned.
                 let raw = l.content.trim_end_matches('\n');
-                let mut content = if UnicodeWidthStr::width(raw) > content_w {
+                let content = if UnicodeWidthStr::width(raw) > content_w {
                     let budget = content_w.saturating_sub(1);
                     let mut used = 0usize;
                     let mut truncated = String::new();
@@ -274,15 +275,25 @@ impl DiffView {
                 } else {
                     raw.to_string()
                 };
+                // Pad separately from the content so highlighting only colors
+                // real characters and both columns still line up.
                 let used = UnicodeWidthStr::width(content.as_str());
-                if used < content_w {
-                    content.push_str(&" ".repeat(content_w - used));
-                }
-                vec![
+                let pad = content_w.saturating_sub(used);
+
+                let mut spans = vec![
                     Span::styled(format!("{} ", num_str), Style::default().fg(theme.dimmed)),
                     Span::styled(prefix.to_string(), style),
-                    Span::styled(content, style),
-                ]
+                ];
+                // Syntax-highlight the code; the +/- marker keeps the
+                // add/delete signal. Flat fallback when no syntax matches.
+                match super::highlight::highlight_line(path, &content) {
+                    Some(hl) if !hl.is_empty() => spans.extend(hl),
+                    _ => spans.push(Span::styled(content, style)),
+                }
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                spans
             }
         }
     }
@@ -342,8 +353,14 @@ impl DiffView {
 
                     if split {
                         for row in super::split::build_split_rows(hunk) {
-                            let mut spans =
-                                Self::split_cell(row.left, true, num_width, half_content_w, theme);
+                            let mut spans = Self::split_cell(
+                                row.left,
+                                true,
+                                num_width,
+                                half_content_w,
+                                &file.path,
+                                theme,
+                            );
                             spans.push(Span::styled(
                                 " \u{2502} ",
                                 Style::default().fg(theme.border),
@@ -353,6 +370,7 @@ impl DiffView {
                                 false,
                                 num_width,
                                 half_content_w,
+                                &file.path,
                                 theme,
                             ));
                             lines.push(Line::from(spans));
@@ -818,6 +836,55 @@ mod tests {
         assert!(
             rendered_has_rgb_fg(&mut view, 120, 24),
             "expected syntect truecolor spans in the rendered .cs diff"
+        );
+    }
+
+    #[test]
+    fn split_diff_syntax_highlights_known_language() {
+        use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileDiff};
+        use std::path::PathBuf;
+
+        let file = DiffFile {
+            path: PathBuf::from("Foo.cs"),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+        };
+        let diff = FileDiff {
+            file: file.clone(),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    DiffLine {
+                        tag: ChangeTag::Delete,
+                        old_line_num: Some(1),
+                        new_line_num: None,
+                        content: "public class Old { }\n".to_string(),
+                    },
+                    DiffLine {
+                        tag: ChangeTag::Insert,
+                        old_line_num: None,
+                        new_line_num: Some(1),
+                        content: "public class New { }\n".to_string(),
+                    },
+                ],
+            }],
+            is_binary: false,
+        };
+        let mut view = DiffView::test_default();
+        view.files = vec![file];
+        view.selected_file = 0;
+        view.diff_cache.insert(view.diff_key(0), diff);
+        // Side-by-side is a separate render path from unified; it must
+        // highlight too (profiles can set diff.split_view = true).
+        view.split_view = true;
+        assert!(
+            rendered_has_rgb_fg(&mut view, 140, 24),
+            "expected syntect truecolor spans in the split .cs diff"
         );
     }
 
