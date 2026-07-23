@@ -1782,7 +1782,19 @@ impl HomeView {
 
         // Handle commits view (full-screen takeover)
         if let Some(ref mut commits_view) = self.commits_view {
-            match commits_view.handle_key(key) {
+            let action = commits_view.handle_key(key);
+            if let Some((session_id, new_override)) = commits_view.take_pending_override() {
+                if let Err(e) = self.apply_user_action(&session_id, |inst| {
+                    inst.base_branch_override = new_override.clone();
+                }) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        "Failed to persist base_branch_override: {}",
+                        e
+                    );
+                }
+            }
+            match action {
                 crate::tui::commits::CommitsAction::Continue => return None,
                 crate::tui::commits::CommitsAction::Close => {
                     self.commits_view = None;
@@ -3545,7 +3557,13 @@ impl HomeView {
             .or_else(|| crate::git::diff::get_default_base_ref(&repos[0].root).ok())
             .unwrap_or_else(|| "main".to_string());
 
-        self.commits_view = Some(crate::tui::commits::CommitsView::new(&repos, base_branch));
+        self.commits_view = Some(crate::tui::commits::CommitsView::new(
+            repos,
+            base_branch,
+            Some(inst.id.clone()),
+            inst.source_profile.clone(),
+            self.file_watch.clone(),
+        ));
     }
 
     fn open_serve(&mut self) {
