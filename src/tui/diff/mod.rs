@@ -1,5 +1,6 @@
 //! Diff view - view changes against a base branch
 
+mod highlight;
 mod input;
 mod render;
 mod split;

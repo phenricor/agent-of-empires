@@ -110,6 +110,12 @@ rattles = "0.3"
 # Regex
 regex = "1.10"
 
+# Syntax highlighting for the TUI diff view. `default-fancy` uses the pure-Rust
+# fancy-regex engine, avoiding the onig C dependency.
+syntect = { version = "5.2", default-features = false, features = [
+    "default-fancy",
+] }
+
 # Git operations
 git2 = { version = "0.21", features = ["vendored-openssl"] }
 

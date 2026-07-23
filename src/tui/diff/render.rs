@@ -367,14 +367,21 @@ impl DiffView {
 
                             let content = line.content.trim_end_matches('\n');
 
-                            lines.push(Line::from(vec![
+                            let mut spans = vec![
                                 Span::styled(
                                     format!("{} {} ", old_num, new_num),
                                     Style::default().fg(theme.dimmed),
                                 ),
                                 Span::styled(prefix, style),
-                                Span::styled(content, style),
-                            ]));
+                            ];
+                            // Syntax-highlight the code; the +/- marker above
+                            // carries the add/delete signal. Fall back to the
+                            // flat tag color when no syntax matches the file.
+                            match super::highlight::highlight_line(&file.path, content) {
+                                Some(hl) if !hl.is_empty() => spans.extend(hl),
+                                _ => spans.push(Span::styled(content.to_string(), style)),
+                            }
+                            lines.push(Line::from(spans));
                         }
                     }
 
