@@ -3,7 +3,10 @@
 //! This module provides shared logic for building new session instances,
 //! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -43,6 +46,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// When true (and a worktree branch is set), scan `path` for nested git
+    /// repos and create a worktree for each, preserving their relative layout.
+    /// Takes precedence over `extra_repo_paths`; if no nested repos are found,
+    /// falls back to a single-repo worktree.
+    pub scan_nested: bool,
     /// Scratch session: ignore `path`, provision a fresh directory under
     /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
     /// the deletion path removes the directory. Mutually exclusive with
@@ -157,6 +165,59 @@ pub(crate) fn project_base_branches(profile: &str) -> std::collections::HashMap<
 pub struct WorkspaceRepoSpec {
     pub path: PathBuf,
     pub base_branch: Option<String>,
+    /// Where this repo's worktree lands relative to the workspace root.
+    /// Flat placement uses the repo's basename; nested placement (e.g. from
+    /// `--scan`) uses the repo's path relative to the launch directory so the
+    /// original tree layout is preserved and inter-repo references resolve.
+    pub dest_subpath: PathBuf,
+}
+
+/// Scan `launch_dir` for nested git repos and build nested workspace specs,
+/// each landing at its path relative to `launch_dir` so the tree layout is
+/// preserved. `resolve_base` yields the base branch for a given repo path.
+/// Returns empty when `launch_dir` has no nested repos below it.
+pub fn scan_workspace_specs(
+    launch_dir: &Path,
+    resolve_base: impl Fn(&Path) -> Option<String>,
+) -> Vec<WorkspaceRepoSpec> {
+    let launch_abs = launch_dir
+        .canonicalize()
+        .unwrap_or_else(|_| launch_dir.to_path_buf());
+    crate::git::scan_nested_repos(&launch_abs)
+        .into_iter()
+        .map(|repo| {
+            let dest = repo
+                .strip_prefix(&launch_abs)
+                .unwrap_or(&repo)
+                .to_path_buf();
+            let base = resolve_base(&repo);
+            WorkspaceRepoSpec::nested(repo, base, dest)
+        })
+        .collect()
+}
+
+impl WorkspaceRepoSpec {
+    /// Flat placement: worktree lands at `<workspace>/<basename>`.
+    pub fn flat(path: PathBuf, base_branch: Option<String>) -> Self {
+        let dest_subpath = path
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("repo"));
+        Self {
+            path,
+            base_branch,
+            dest_subpath,
+        }
+    }
+
+    /// Nested placement: worktree lands at `<workspace>/<dest_subpath>`.
+    pub fn nested(path: PathBuf, base_branch: Option<String>, dest_subpath: PathBuf) -> Self {
+        Self {
+            path,
+            base_branch,
+            dest_subpath,
+        }
+    }
 }
 
 /// Create a multi-repo workspace with worktrees for each repository.
@@ -182,32 +243,37 @@ pub fn create_workspace(
     let workspace_dir = workspace_path.to_string_lossy().to_string();
     std::fs::create_dir_all(&workspace_path)?;
 
-    // (canonicalized path, resolved base branch) for the primary repo followed
-    // by every extra repo. The primary path is left as the caller passed it;
-    // extras are canonicalized to match how they are stored/compared.
-    let all_repos: Vec<(PathBuf, Option<String>)> =
-        std::iter::once((primary.path.clone(), primary.base_branch.clone()))
-            .chain(extra_repos.iter().map(|r| {
-                (
-                    r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
-                    r.base_branch.clone(),
-                )
-            }))
-            .collect();
+    // (canonicalized path, resolved base branch, destination subpath) for the
+    // primary repo followed by every extra repo. The primary path is left as
+    // the caller passed it; extras are canonicalized to match how they are
+    // stored/compared. dest_subpath decides where each worktree lands under the
+    // workspace root (basename for flat, relative path for nested layouts).
+    let all_repos: Vec<(PathBuf, Option<String>, PathBuf)> = std::iter::once((
+        primary.path.clone(),
+        primary.base_branch.clone(),
+        primary.dest_subpath.clone(),
+    ))
+    .chain(extra_repos.iter().map(|r| {
+        (
+            r.path.canonicalize().unwrap_or_else(|_| r.path.clone()),
+            r.base_branch.clone(),
+            r.dest_subpath.clone(),
+        )
+    }))
+    .collect();
 
-    // Check for duplicate repo directory names
-    let mut seen_names = std::collections::HashSet::new();
-    for (repo_path, _) in &all_repos {
-        let name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-        if !seen_names.insert(name.clone()) {
+    // Check for duplicate destination subpaths (two repos landing on the same
+    // spot). Flat layouts collide on basename; nested layouts only collide when
+    // the relative paths are genuinely identical.
+    let mut seen_dests = std::collections::HashSet::new();
+    for (_, _, dest_subpath) in &all_repos {
+        let dest = dest_subpath.to_string_lossy().to_string();
+        if !seen_dests.insert(dest.clone()) {
             let _ = std::fs::remove_dir_all(&workspace_path);
             bail!(
-                "Duplicate repository name '{}' in workspace\n\
+                "Duplicate repository destination '{}' in workspace\n\
                  Tip: Rename one of the directories to avoid the collision",
-                name
+                dest
             );
         }
     }
@@ -231,7 +297,7 @@ pub fn create_workspace(
         base_branch: Option<String>,
     }
     let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
-    for (repo_path, base_branch) in &all_repos {
+    for (repo_path, base_branch, dest_subpath) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
             cleanup(&[], &workspace_path);
             bail!(
@@ -251,7 +317,22 @@ pub fn create_workspace(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
 
-        let worktree_subdir = workspace_path.join(&repo_name);
+        let worktree_subdir = workspace_path.join(dest_subpath);
+
+        // Nested layouts land under intermediate dirs (e.g. src/Core) that git
+        // worktree add won't create; make them so the add succeeds.
+        if let Some(parent) = worktree_subdir.parent() {
+            if parent != workspace_path.as_path() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    cleanup(&[], &workspace_path);
+                    bail!(
+                        "Failed to create workspace subdirectory {}: {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+        }
 
         plans.push(RepoPlan {
             repo_path: repo_path.clone(),
@@ -478,48 +559,43 @@ pub fn build_instance(
     };
 
     if let Some(branch) = &effective_worktree_branch {
-        if !params.extra_repo_paths.is_empty() {
-            let primary_path = PathBuf::from(&params.path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(&params.path));
+        let session_base = params.base_branch.as_deref();
+        let global_default = config.worktree.default_base_branch.as_deref();
+        let project_bases = project_base_branches(profile);
+        let resolve =
+            |p: &Path| resolve_repo_base_branch(p, session_base, &project_bases, global_default);
+        let primary_path = PathBuf::from(&params.path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&params.path));
 
-            let session_base = params.base_branch.as_deref();
-            let global_default = config.worktree.default_base_branch.as_deref();
-            let project_bases = project_base_branches(profile);
-
+        // Build the multi-repo spec list. `scan_nested` scans `path` and keeps
+        // each repo's relative layout; otherwise explicit extra repos land flat.
+        // Both are empty for a plain single repo, which falls through below.
+        let workspace_specs: Vec<WorkspaceRepoSpec> = if params.scan_nested {
+            scan_workspace_specs(&primary_path, resolve)
+        } else if !params.extra_repo_paths.is_empty() {
             // Every repo, including the launch repo, forks from its own
             // registered per-project default when no explicit session base is
             // given. Keyed by repo root so a launch path inside a subdirectory
             // still matches a root-registered project.
-            let primary = WorkspaceRepoSpec {
-                base_branch: resolve_repo_base_branch(
-                    &primary_path,
-                    session_base,
-                    &project_bases,
-                    global_default,
-                ),
-                path: primary_path,
-            };
-            let extra_repos: Vec<WorkspaceRepoSpec> = params
-                .extra_repo_paths
-                .iter()
-                .map(|p| {
-                    let path = PathBuf::from(p);
-                    WorkspaceRepoSpec {
-                        base_branch: resolve_repo_base_branch(
-                            &path,
-                            session_base,
-                            &project_bases,
-                            global_default,
-                        ),
-                        path,
-                    }
-                })
-                .collect();
+            let mut specs = vec![WorkspaceRepoSpec::flat(
+                primary_path.clone(),
+                resolve(&primary_path),
+            )];
+            specs.extend(params.extra_repo_paths.iter().map(|p| {
+                let path = PathBuf::from(p);
+                let base_branch = resolve(&path);
+                WorkspaceRepoSpec::flat(path, base_branch)
+            }));
+            specs
+        } else {
+            Vec::new()
+        };
 
+        if let Some((primary, extra_repos)) = workspace_specs.split_first() {
             let ws_result = create_workspace(
-                &primary,
-                &extra_repos,
+                primary,
+                extra_repos,
                 branch,
                 params.create_new_branch,
                 &config.worktree.workspace_path_template,
@@ -1514,14 +1590,8 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
-            &[WorkspaceRepoSpec {
-                path: repo_b,
-                base_branch: None,
-            }],
+            &WorkspaceRepoSpec::flat(repo_a, None),
+            &[WorkspaceRepoSpec::flat(repo_b, None)],
             "nonexistent-branch",
             false,
             &template,
@@ -1562,10 +1632,7 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
+            &WorkspaceRepoSpec::flat(repo_a, None),
             &[],
             "nonexistent-branch",
             false,
@@ -1727,14 +1794,8 @@ mod tests {
             .into_owned();
 
         let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: primary,
-                base_branch: None,
-            },
-            &[WorkspaceRepoSpec {
-                path: extra,
-                base_branch: Some("release".to_string()),
-            }],
+            &WorkspaceRepoSpec::flat(primary, None),
+            &[WorkspaceRepoSpec::flat(extra, Some("release".to_string()))],
             "feature-x",
             true,
             &template,
@@ -1754,6 +1815,94 @@ mod tests {
             head.id(),
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
+        );
+    }
+
+    #[test]
+    fn create_workspace_preserves_nested_dest_subpaths() {
+        // Two repos with the SAME basename land at distinct nested subpaths;
+        // the flat-layout dedupe would have rejected this, and the worktrees
+        // must materialize under their relative dirs (src/Core, src/Jobs).
+        let parent_a = init_repo_with_commit("Service");
+        let parent_b = init_repo_with_commit("Service");
+        let repo_a = parent_a.path().join("Service");
+        let repo_b = parent_b.path().join("Service");
+
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec::nested(repo_a, None, PathBuf::from("src/Core/Service")),
+            &[WorkspaceRepoSpec::nested(
+                repo_b,
+                None,
+                PathBuf::from("src/Jobs/Service"),
+            )],
+            "feature-x",
+            true,
+            &template,
+            true,
+        )
+        .expect("nested workspace creation should succeed");
+
+        let root = &result.workspace_path;
+        assert!(
+            root.join("src/Core/Service/.git").exists(),
+            "primary worktree should land at src/Core/Service"
+        );
+        assert!(
+            root.join("src/Jobs/Service/.git").exists(),
+            "extra worktree should land at src/Jobs/Service"
+        );
+        // Both repos are recorded, distinguished by their nested worktree paths.
+        assert_eq!(result.workspace_info.repos.len(), 2);
+        assert!(
+            result
+                .workspace_info
+                .repos
+                .iter()
+                .any(|r| r.worktree_path.ends_with("src/Core/Service")),
+            "workspace info should carry the nested worktree path"
+        );
+    }
+
+    #[test]
+    fn create_workspace_rejects_identical_dest_subpaths() {
+        let parent_a = init_repo_with_commit("A");
+        let parent_b = init_repo_with_commit("B");
+        let repo_a = parent_a.path().join("A");
+        let repo_b = parent_b.path().join("B");
+
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec::nested(repo_a, None, PathBuf::from("same/spot")),
+            &[WorkspaceRepoSpec::nested(
+                repo_b,
+                None,
+                PathBuf::from("same/spot"),
+            )],
+            "feature-x",
+            true,
+            &template,
+            true,
+        );
+        let err = match result {
+            Ok(_) => panic!("identical dest subpaths must be rejected"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            err.contains("Duplicate repository destination"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1787,6 +1936,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            scan_nested: false,
             scratch: false,
             fork_seed: None,
         }
@@ -1966,6 +2116,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            scan_nested: false,
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {
                 parent_agent_session_id: "parent-uuid".into(),
@@ -2008,6 +2159,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            scan_nested: false,
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),

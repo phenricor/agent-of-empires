@@ -209,6 +209,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            scan_nested: false,
             scratch,
             #[cfg(feature = "serve")]
             fork_seed,

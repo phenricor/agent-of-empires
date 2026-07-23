@@ -77,6 +77,13 @@ pub struct AddArgs {
     #[arg(long = "project")]
     projects: Vec<String>,
 
+    /// Scan for nested git repositories below PATH and create a worktree for
+    /// each, preserving their relative layout (like claude-squad's `-g`). Use
+    /// with --worktree. PATH itself need not be a git repository. Mutually
+    /// exclusive with --repo/--project.
+    #[arg(long = "scan", conflicts_with_all = ["extra_repos", "projects"])]
+    scan: bool,
+
     /// Skip `git submodule update --init --recursive` after creating the
     /// worktree, overriding the `worktree.init_submodules` config (default
     /// true). Useful for repos with large or deeply nested submodule trees
@@ -142,6 +149,7 @@ pub struct AddArgs {
             "base_branch",
             "extra_repos",
             "projects",
+            "scan",
             "no_submodules",
         ]
     )]
@@ -192,6 +200,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         && explicit_worktree_branch(&args).is_none()
     {
         bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
+    }
+
+    if args.scan && explicit_worktree_branch(&args).is_none() {
+        bail!("--scan requires --worktree to specify a branch\nTip: aoe add /path --scan -w branch-name -b");
     }
 
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
@@ -408,7 +420,54 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let branch = branch_owned.as_str();
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
-        if !all_extra_repos.is_empty() {
+        if args.scan {
+            // Group-scan mode: discover every nested repo below PATH and create
+            // a worktree for each, preserving its path relative to PATH so the
+            // original tree layout (and inter-repo references) is reproduced.
+            let session_base = args.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = builder::project_base_branches(profile);
+            let specs = builder::scan_workspace_specs(&path, |repo| {
+                builder::resolve_base_branch(
+                    session_base,
+                    project_bases
+                        .get(&crate::session::projects::canonical_key(
+                            &repo.to_string_lossy(),
+                        ))
+                        .map(String::as_str),
+                    global_default,
+                )
+            });
+            let Some((primary, extra_repos)) = specs.split_first() else {
+                bail!("--scan found no git repositories under {}", path.display());
+            };
+
+            println!("Scanning nested repos under {}...", path.display());
+            let ws_result = builder::create_workspace(
+                primary,
+                extra_repos,
+                branch,
+                args.create_branch,
+                &config.worktree.workspace_path_template,
+                init_submodules,
+            )?;
+
+            for repo in &ws_result.workspace_info.repos {
+                println!(
+                    "  Created worktree: {} -> {}",
+                    repo.name, repo.worktree_path
+                );
+            }
+
+            path = ws_result.workspace_path;
+            workspace_info_opt = Some(ws_result.workspace_info);
+
+            for w in &ws_result.warnings {
+                eprintln!("⚠ {}", w);
+            }
+
+            println!("✓ Workspace created successfully ({} repos)", specs.len());
+        } else if !all_extra_repos.is_empty() {
             let session_base = args.base_branch.as_deref();
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = builder::project_base_branches(profile);
@@ -423,16 +482,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
             // The launch repo never consults the per-project layer: explicit
             // session base, then the global/profile default.
-            let primary = builder::WorkspaceRepoSpec {
-                base_branch: builder::resolve_base_branch(session_base, None, global_default),
-                path: path.clone(),
-            };
+            let primary = builder::WorkspaceRepoSpec::flat(
+                path.clone(),
+                builder::resolve_base_branch(session_base, None, global_default),
+            );
             let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
                 .iter()
-                .map(|p| builder::WorkspaceRepoSpec {
-                    base_branch: resolve_extra(p),
-                    path: p.clone(),
-                })
+                .map(|p| builder::WorkspaceRepoSpec::flat(p.clone(), resolve_extra(p)))
                 .collect();
 
             let ws_result = builder::create_workspace(

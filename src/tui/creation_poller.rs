@@ -325,6 +325,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            scan_nested: false,
             sandbox: false,
             sandbox_image: String::new(),
             yolo_mode: false,

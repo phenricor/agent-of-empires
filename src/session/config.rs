@@ -1844,6 +1844,18 @@ pub struct WorktreeConfig {
     )]
     pub enabled: bool,
 
+    /// Scan the session directory for nested git repos and include a worktree
+    /// for each, preserving their layout (like claude-squad's group mode).
+    /// When on, the new-session dialog offers this whenever the chosen
+    /// directory contains nested repos.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Scan Nested Repos",
+        widget = "toggle",
+        web = "elevation:worktree config affects host filesystem"
+    )]
+    pub scan_nested_repos: bool,
+
     /// Template for worktree paths ({repo-name}, {branch}).
     #[serde(default = "default_worktree_template")]
     #[setting(
@@ -1936,6 +1948,7 @@ impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            scan_nested_repos: true,
             path_template: default_worktree_template(),
             bare_repo_path_template: default_bare_repo_template(),
             auto_cleanup: true,

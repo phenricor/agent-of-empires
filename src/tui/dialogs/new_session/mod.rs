@@ -100,6 +100,10 @@ pub struct NewSessionData {
     /// back to the repository's default branch. See #948.
     pub base_branch: Option<String>,
     pub extra_repo_paths: Vec<String>,
+    /// Scan `path` for nested git repos and include a worktree for each,
+    /// preserving their relative layout. Set from the new-session dialog's
+    /// "include nested repos" prompt when the chosen directory has any.
+    pub scan_nested: bool,
     pub sandbox: bool,
     /// The sandbox image to use (always populated from the input field).
     pub sandbox_image: String,
@@ -153,6 +157,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
+            scan_nested: data.scan_nested,
             scratch: data.scratch,
             fork_seed: data.fork_seed,
         }
@@ -196,6 +201,10 @@ pub struct NewSessionDialog {
     /// treat it exactly like `has_yolo` / `has_sandbox`.
     pub(super) structured_capable: bool,
     /// Additional repo paths for multi-repo workspace
+    /// Default for including nested repos, from `worktree.scan_nested_repos`.
+    /// When set, a worktree session scans its directory for nested repos and
+    /// includes a worktree for each (no-op when the directory has none).
+    pub(super) scan_nested_default: bool,
     pub(super) workspace_repos: Vec<String>,
     /// Whether the workspace repos list is expanded (editing mode)
     pub(super) workspace_repos_expanded: bool,
@@ -528,6 +537,7 @@ impl NewSessionDialog {
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
+            scan_nested_default: config.worktree.scan_nested_repos,
             workspace_repos: Vec::new(),
             workspace_repos_expanded: false,
             workspace_repo_selected_index: 0,
@@ -883,6 +893,7 @@ impl NewSessionDialog {
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
+            scan_nested_default: config.worktree.scan_nested_repos,
             workspace_repos: Vec::new(),
             workspace_repos_expanded: false,
             workspace_repo_selected_index: 0,
@@ -956,6 +967,7 @@ impl NewSessionDialog {
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
+            scan_nested_default: false,
             workspace_repos: Vec::new(),
             workspace_repos_expanded: false,
             workspace_repo_selected_index: 0,
@@ -2163,6 +2175,13 @@ impl NewSessionDialog {
             } else {
                 Vec::new()
             },
+            // Auto-include nested repos for a worktree session when enabled.
+            // Ignored when explicit workspace repos were added; a no-op when the
+            // directory has no nested repos (falls back to a single worktree).
+            scan_nested: !self.scratch
+                && self.worktree_enabled
+                && self.scan_nested_default
+                && self.workspace_repos.is_empty(),
             sandbox: self.sandbox_enabled,
             sandbox_image: self.sandbox_image.value().trim().to_string(),
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
