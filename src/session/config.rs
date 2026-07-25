@@ -1592,6 +1592,13 @@ pub struct DiffConfig {
     #[serde(default)]
     #[setting(label = "Side-by-side diff", widget = "toggle")]
     pub split_view: bool,
+
+    /// Compare against the repository's default branch, re-resolved live, so
+    /// the diff always tracks whichever branch the worktree currently has
+    /// checked out. Picking a branch explicitly (b) overrides this per session.
+    #[serde(default)]
+    #[setting(label = "Follow current branch", widget = "toggle")]
+    pub follow_current_branch: bool,
 }
 
 impl Default for DiffConfig {
@@ -1600,6 +1607,7 @@ impl Default for DiffConfig {
             default_branch: None,
             context_lines: 3,
             split_view: false,
+            follow_current_branch: false,
         }
     }
 }

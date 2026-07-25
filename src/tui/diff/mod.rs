@@ -65,6 +65,11 @@ pub struct DiffView {
     /// Base branch to compare against
     pub(crate) base_branch: String,
 
+    /// When set, the base is re-resolved to the repo default on every refresh
+    /// so the diff follows the worktree's current branch. Cleared once the user
+    /// picks a base explicitly. Driven by `diff.follow_current_branch`.
+    pub(crate) auto_base: bool,
+
     /// List of changed files
     pub(crate) files: Vec<DiffFile>,
 
@@ -187,11 +192,25 @@ impl DiffView {
             resolve_config_or_warn(&profile)
         };
 
-        let base_branch = base_override
+        let explicit_override = base_override
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(str::to_string)
+            .map(str::to_string);
+
+        // "Follow current branch": with the toggle on and no explicit override,
+        // the base tracks the repo default (re-resolved on every refresh), so
+        // switching the worktree's branch keeps the diff meaningful.
+        let auto_base = config.diff.follow_current_branch && explicit_override.is_none();
+
+        let base_branch = explicit_override
+            .or_else(|| {
+                if auto_base {
+                    get_default_base_ref(&repo_path).ok()
+                } else {
+                    None
+                }
+            })
             .or_else(|| {
                 worktree_base
                     .as_deref()
@@ -216,6 +235,7 @@ impl DiffView {
             session_id,
             profile,
             base_branch,
+            auto_base,
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
@@ -270,6 +290,14 @@ impl DiffView {
     /// that errors (e.g. the base ref is missing there) is skipped rather than
     /// failing the whole view.
     pub fn refresh_files(&mut self) -> anyhow::Result<()> {
+        // Follow-current-branch: re-resolve the base to the primary repo's
+        // default each refresh, so a branch switch is reflected without reopening.
+        if self.auto_base {
+            if let Ok(base) = get_default_base_ref(&self.repo_path) {
+                self.base_branch = base;
+            }
+        }
+
         let mut files = Vec::new();
         let mut file_repo_idx = Vec::new();
         for (i, repo) in self.repos.iter().enumerate() {
@@ -368,6 +396,8 @@ impl DiffView {
     /// message; the in-memory switch still applies. See #970.
     pub fn select_branch(&mut self, branch: String) {
         self.base_branch = branch;
+        // An explicit pick pins the base; stop auto-following.
+        self.auto_base = false;
         self.branch_select = None;
         self.warning_dialog = check_merge_base_status(&self.repo_path, &self.base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
@@ -542,6 +572,7 @@ impl DiffView {
             session_id: None,
             profile: String::new(),
             base_branch: "main".to_string(),
+            auto_base: false,
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
@@ -623,6 +654,30 @@ mod tests {
         let k1 = view.diff_key(1);
         assert_ne!(k0, k1);
         assert!(k0.starts_with(a.path()) || k0.starts_with(b.path()));
+    }
+
+    #[test]
+    fn auto_base_re_resolves_to_default_and_a_pick_pins_it() {
+        let a = repo_with_change("f.txt");
+        let mut view = DiffView::test_default();
+        view.repo_path = a.path().to_path_buf();
+        view.repos = vec![DiffRepo {
+            name: "A".to_string(),
+            root: a.path().to_path_buf(),
+        }];
+        view.auto_base = true;
+        view.base_branch = "stale-base".to_string();
+
+        // Refresh re-resolves the base to the repo's real default, dropping the
+        // stale value, because auto_base follows the current branch.
+        view.refresh_files().unwrap();
+        assert_ne!(view.base_branch, "stale-base");
+        assert!(view.auto_base);
+
+        // Picking a branch pins it and stops following.
+        view.select_branch("chosen-base".to_string());
+        assert!(!view.auto_base);
+        assert_eq!(view.base_branch, "chosen-base");
     }
 
     #[test]

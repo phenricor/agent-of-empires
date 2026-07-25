@@ -93,6 +93,10 @@ impl DiffView {
             ),
             Span::styled("vs ", Style::default().fg(theme.dimmed)),
             Span::styled(&self.base_branch, Style::default().fg(theme.accent)),
+            Span::styled(
+                if self.auto_base { " (auto)" } else { "" },
+                Style::default().fg(theme.dimmed),
+            ),
             Span::styled("  |  ", Style::default().fg(theme.border)),
             Span::styled(
                 format!("{} changed", file_count),
