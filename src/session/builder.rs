@@ -172,10 +172,14 @@ pub struct WorkspaceRepoSpec {
     pub dest_subpath: PathBuf,
 }
 
-/// Scan `launch_dir` for nested git repos and build nested workspace specs,
-/// each landing at its path relative to `launch_dir` so the tree layout is
-/// preserved. `resolve_base` yields the base branch for a given repo path.
-/// Returns empty when `launch_dir` has no nested repos below it.
+/// Scan `launch_dir` for git repos and build nested workspace specs, each
+/// landing at its path relative to `launch_dir` so the tree layout is
+/// preserved. `launch_dir` itself is included when it is a repo root (a
+/// monorepo root whose subprojects are their own repos), landing on the
+/// workspace root with an empty dest subpath. `resolve_base` yields the base
+/// branch for a given repo path. Returns empty when the scan turns up nothing
+/// but `launch_dir` itself, so a plain single repo keeps taking the ordinary
+/// worktree path instead of becoming a one-repo workspace.
 pub fn scan_workspace_specs(
     launch_dir: &Path,
     resolve_base: impl Fn(&Path) -> Option<String>,
@@ -183,7 +187,11 @@ pub fn scan_workspace_specs(
     let launch_abs = launch_dir
         .canonicalize()
         .unwrap_or_else(|_| launch_dir.to_path_buf());
-    crate::git::scan_nested_repos(&launch_abs)
+    let repos = crate::git::scan_nested_repos(&launch_abs);
+    if repos.as_slice() == [launch_abs.clone()] {
+        return Vec::new();
+    }
+    repos
         .into_iter()
         .map(|repo| {
             let dest = repo
@@ -241,7 +249,20 @@ pub fn create_workspace(
     let workspace_path =
         primary_git_wt.compute_path(branch, workspace_template, session_id_short)?;
     let workspace_dir = workspace_path.to_string_lossy().to_string();
-    std::fs::create_dir_all(&workspace_path)?;
+
+    // A scanned monorepo root has an empty dest subpath, meaning its worktree IS
+    // the workspace dir. `create_worktree` refuses a path that already exists,
+    // so leave the dir to git and only guarantee its parent.
+    let root_is_a_repo = std::iter::once(primary)
+        .chain(extra_repos)
+        .any(|r| r.dest_subpath.as_os_str().is_empty());
+    if root_is_a_repo {
+        if let Some(parent) = workspace_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    } else {
+        std::fs::create_dir_all(&workspace_path)?;
+    }
 
     // (canonicalized path, resolved base branch, destination subpath) for the
     // primary repo followed by every extra repo. The primary path is left as
@@ -296,6 +317,30 @@ pub fn create_workspace(
         worktree_subdir: PathBuf,
         base_branch: Option<String>,
     }
+    let run_plan = |plan: &RepoPlan| -> std::result::Result<Vec<String>, String> {
+        let repo_start = std::time::Instant::now();
+        let result = (|| -> std::result::Result<Vec<String>, String> {
+            let git_wt = GitWorktree::new(plan.main_repo_path.clone())
+                .map_err(|e| format!("{}: {}", plan.repo_name, e))?
+                .with_init_submodules(init_submodules);
+            git_wt
+                .create_worktree(
+                    branch,
+                    &plan.worktree_subdir,
+                    create_new_branch,
+                    plan.base_branch.as_deref(),
+                )
+                .map_err(|e| format!("{}: {}", plan.repo_name, e))
+        })();
+        tracing::info!(target: "session.create",
+            "workspace create: repo={} elapsed={:?} ok={}",
+            plan.repo_name,
+            repo_start.elapsed(),
+            result.is_ok()
+        );
+        result
+    };
+
     let mut plans: Vec<RepoPlan> = Vec::with_capacity(all_repos.len());
     for (repo_path, base_branch, dest_subpath) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
@@ -317,93 +362,44 @@ pub fn create_workspace(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
 
-        let worktree_subdir = workspace_path.join(dest_subpath);
-
-        // Nested layouts land under intermediate dirs (e.g. src/Core) that git
-        // worktree add won't create; make them so the add succeeds.
-        if let Some(parent) = worktree_subdir.parent() {
-            if parent != workspace_path.as_path() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    cleanup(&[], &workspace_path);
-                    bail!(
-                        "Failed to create workspace subdirectory {}: {}",
-                        parent.display(),
-                        e
-                    );
-                }
-            }
-        }
-
         plans.push(RepoPlan {
             repo_path: repo_path.clone(),
             repo_name,
             main_repo_path,
-            worktree_subdir,
+            // join("") would append a trailing separator that leaks into the
+            // stored worktree path, so an empty dest is the workspace root.
+            worktree_subdir: if dest_subpath.as_os_str().is_empty() {
+                workspace_path.clone()
+            } else {
+                workspace_path.join(dest_subpath)
+            },
             base_branch: base_branch.clone(),
         });
     }
 
-    // Run create_worktree for every repo concurrently. Each worktree lives in
-    // a different directory and uses a different main repo, so the operations
-    // are independent. Network IO (git fetch + git submodule update) dominates
-    // each step, so fanning out cuts wall time roughly to that of the slowest
-    // repo.
+    // A scanned monorepo root lands on the workspace root itself (empty
+    // dest_subpath), with its subproject repos nested inside. It has to be
+    // checked out before anything else touches that directory: git refuses to
+    // add a worktree into a non-empty dir, and the nested repos' intermediate
+    // dirs would fill it.
+    let root_plan = plans
+        .iter()
+        .position(|p| p.worktree_subdir == workspace_path)
+        .map(|i| plans.remove(i));
+
+    let total_repos = plans.len() + usize::from(root_plan.is_some());
     let create_start = std::time::Instant::now();
-    let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = plans
-                .iter()
-                .map(|plan| {
-                    let branch = branch.to_string();
-                    let base = plan.base_branch.clone();
-                    let main_repo_path = plan.main_repo_path.clone();
-                    let worktree_subdir = plan.worktree_subdir.clone();
-                    let repo_name = plan.repo_name.clone();
-                    scope.spawn(move || -> std::result::Result<Vec<String>, String> {
-                        let repo_start = std::time::Instant::now();
-                        let result = (|| -> std::result::Result<Vec<String>, String> {
-                            let git_wt = GitWorktree::new(main_repo_path)
-                                .map_err(|e| format!("{}: {}", repo_name, e))?
-                                .with_init_submodules(init_submodules);
-                            git_wt
-                                .create_worktree(
-                                    &branch,
-                                    &worktree_subdir,
-                                    create_new_branch,
-                                    base.as_deref(),
-                                )
-                                .map_err(|e| format!("{}: {}", repo_name, e))
-                        })();
-                        tracing::info!(target: "session.create",
-                            "workspace create: repo={} elapsed={:?} ok={}",
-                            repo_name,
-                            repo_start.elapsed(),
-                            result.is_ok()
-                        );
-                        result
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| match h.join() {
-                    Ok(r) => r,
-                    Err(_) => Err("worktree thread panicked".to_string()),
-                })
-                .collect()
-        });
-    tracing::info!(target: "session.create",
-        "workspace create: {} repos completed in {:?}",
-        plans.len(),
-        create_start.elapsed()
-    );
 
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut created_worktrees: Vec<CreatedWorktree> = Vec::new();
-    let mut repos: Vec<WorkspaceRepo> = Vec::with_capacity(plans.len());
-
-    for (plan, result) in plans.iter().zip(parallel_results) {
+    let mut repos: Vec<WorkspaceRepo> = Vec::with_capacity(total_repos);
+    let record = |plan: &RepoPlan,
+                  result: std::result::Result<Vec<String>, String>,
+                  warnings: &mut Vec<String>,
+                  errors: &mut Vec<String>,
+                  created_worktrees: &mut Vec<CreatedWorktree>,
+                  repos: &mut Vec<WorkspaceRepo>| {
         match result {
             Ok(w) => {
                 warnings.extend(w);
@@ -422,6 +418,78 @@ pub fn create_workspace(
             }
             Err(msg) => errors.push(msg),
         }
+    };
+
+    if let Some(plan) = &root_plan {
+        let result = run_plan(plan);
+        let failed = result.is_err();
+        record(
+            plan,
+            result,
+            &mut warnings,
+            &mut errors,
+            &mut created_worktrees,
+            &mut repos,
+        );
+        if failed {
+            cleanup(&[], &workspace_path);
+            bail!("Failed to create worktree for {}", errors.remove(0));
+        }
+    }
+
+    // Nested layouts land under intermediate dirs (e.g. src/Core) that git
+    // worktree add won't create; make them so the add succeeds. Deferred until
+    // after the root worktree, which needs the workspace dir still empty.
+    for plan in &plans {
+        if let Some(parent) = plan.worktree_subdir.parent() {
+            if parent != workspace_path.as_path() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    cleanup(&created_worktrees, &workspace_path);
+                    bail!(
+                        "Failed to create workspace subdirectory {}: {}",
+                        parent.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Run create_worktree for every repo concurrently. Each worktree lives in
+    // a different directory and uses a different main repo, so the operations
+    // are independent. Network IO (git fetch + git submodule update) dominates
+    // each step, so fanning out cuts wall time roughly to that of the slowest
+    // repo.
+    let parallel_results: Vec<std::result::Result<Vec<String>, String>> =
+        std::thread::scope(|scope| {
+            let run_plan = &run_plan;
+            let handles: Vec<_> = plans
+                .iter()
+                .map(|plan| scope.spawn(move || run_plan(plan)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| match h.join() {
+                    Ok(r) => r,
+                    Err(_) => Err("worktree thread panicked".to_string()),
+                })
+                .collect()
+        });
+    tracing::info!(target: "session.create",
+        "workspace create: {} repos completed in {:?}",
+        total_repos,
+        create_start.elapsed()
+    );
+
+    for (plan, result) in plans.iter().zip(parallel_results) {
+        record(
+            plan,
+            result,
+            &mut warnings,
+            &mut errors,
+            &mut created_worktrees,
+            &mut repos,
+        );
     }
 
     if !errors.is_empty() {
@@ -1867,6 +1935,55 @@ mod tests {
                 .iter()
                 .any(|r| r.worktree_path.ends_with("src/Core/Service")),
             "workspace info should carry the nested worktree path"
+        );
+    }
+
+    #[test]
+    fn create_workspace_checks_out_monorepo_root_at_workspace_root() {
+        // A scanned monorepo root has an empty dest subpath, so its worktree IS
+        // the workspace dir and the subproject repos nest inside it. git refuses
+        // to add a worktree into a non-empty dir, so this only works if the root
+        // is created before the nested repos' intermediate dirs.
+        let parent_root = init_repo_with_commit("Monorepo");
+        let parent_service = init_repo_with_commit("Service");
+        let repo_root = parent_root.path().join("Monorepo");
+        let repo_service = parent_service.path().join("Service");
+
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec::nested(repo_root, None, PathBuf::new()),
+            &[WorkspaceRepoSpec::nested(
+                repo_service,
+                None,
+                PathBuf::from("src/Core/Service"),
+            )],
+            "feature-x",
+            true,
+            &template,
+            true,
+        )
+        .expect("monorepo-root workspace creation should succeed");
+
+        let root = &result.workspace_path;
+        assert!(
+            root.join(".git").exists(),
+            "the monorepo root worktree should occupy the workspace root"
+        );
+        assert!(
+            root.join("src/Core/Service/.git").exists(),
+            "the subproject worktree should land inside it"
+        );
+        assert_eq!(result.workspace_info.repos.len(), 2);
+        assert_eq!(
+            result.workspace_info.repos[0].worktree_path,
+            root.to_string_lossy(),
+            "the root repo is recorded first, at the workspace root"
         );
     }
 

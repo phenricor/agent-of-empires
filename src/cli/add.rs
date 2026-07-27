@@ -79,8 +79,9 @@ pub struct AddArgs {
 
     /// Scan for nested git repositories below PATH and create a worktree for
     /// each, preserving their relative layout (like claude-squad's `-g`). Use
-    /// with --worktree. PATH itself need not be a git repository. Mutually
-    /// exclusive with --repo/--project.
+    /// with --worktree. PATH itself need not be a git repository; when it is
+    /// one it joins the workspace too, checked out at the workspace root with
+    /// the nested repos inside it. Mutually exclusive with --repo/--project.
     #[arg(long = "scan", conflicts_with_all = ["extra_repos", "projects"])]
     scan: bool,
 

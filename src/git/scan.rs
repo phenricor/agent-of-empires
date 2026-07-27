@@ -1,11 +1,15 @@
 //! Discover nested git repositories below a launch directory.
 //!
-//! Powers `aoe add --scan`: walk the launch dir, collect every nested repo
-//! root, and place a worktree for each while preserving its relative path
-//! (mirrors claude-squad's `-g` group scanning). A repo root is a directory
-//! containing a `.git` *directory*; a `.git` *file* marks a linked worktree,
-//! which we skip so worktree copies aren't mistaken for standalone repos. We
-//! never descend into a repo we found, so submodules stay part of their parent.
+//! Powers `aoe add --scan`: walk the launch dir, collect every repo root, and
+//! place a worktree for each while preserving its relative path (mirrors
+//! claude-squad's `-g` group scanning). A repo root is a directory containing a
+//! `.git` *directory*; a `.git` *file* marks a linked worktree or a submodule
+//! pointer, which we skip so those aren't mistaken for standalone repos. We
+//! never descend into a nested repo we found, so submodules stay part of their
+//! parent. The launch dir is the one exception: when it is itself a repo root it
+//! joins the results *and* we keep descending, because a monorepo root whose
+//! subprojects are separate repos (orchestration files at the top, code in
+//! `src/**`) needs both halves in the workspace.
 
 use std::path::{Path, PathBuf};
 
@@ -30,14 +34,19 @@ fn is_repo_root(dir: &Path) -> bool {
     dir.join(".git").is_dir()
 }
 
-/// Find every nested git repo below `launch_dir` (excluding `launch_dir`
-/// itself), up to `MAX_DEPTH`. Returns absolute paths sorted for a stable
-/// order. Repos found are not descended into.
+/// Find every git repo at or below `launch_dir`, up to `MAX_DEPTH`. Returns
+/// absolute paths sorted for a stable order, so `launch_dir` (a prefix of the
+/// rest) comes first when it is a repo. Nested repos found are not descended
+/// into; `launch_dir` is, so a monorepo root and its subproject repos are all
+/// reported.
 pub fn scan_nested_repos(launch_dir: &Path) -> Vec<PathBuf> {
     let launch_abs = launch_dir
         .canonicalize()
         .unwrap_or_else(|_| launch_dir.to_path_buf());
     let mut found = Vec::new();
+    if is_repo_root(&launch_abs) {
+        found.push(launch_abs.clone());
+    }
     walk(&launch_abs, 0, &mut found);
     found.sort();
     found
@@ -103,6 +112,36 @@ mod tests {
             })
             .collect();
         assert_eq!(rel, vec!["src/Core/RepoA", "src/Jobs/RepoB"]);
+    }
+
+    #[test]
+    fn includes_launch_dir_when_it_is_a_repo_root() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        init_repo(base);
+        init_repo(&base.join("src/Core/RepoA"));
+
+        let repos = scan_nested_repos(base);
+        let canon = base.canonicalize().unwrap();
+        assert_eq!(
+            repos,
+            vec![canon.clone(), canon.join("src/Core/RepoA")],
+            "the monorepo root sorts first, its subproject repo follows"
+        );
+    }
+
+    #[test]
+    fn skips_launch_dir_when_it_is_a_linked_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path();
+        // A linked worktree has a `.git` FILE, so it is not a repo root.
+        std::fs::create_dir_all(base).unwrap();
+        std::fs::write(base.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        init_repo(&base.join("nested"));
+
+        let repos = scan_nested_repos(base);
+        assert_eq!(repos.len(), 1);
+        assert!(repos[0].ends_with("nested"));
     }
 
     #[test]
